@@ -18,30 +18,75 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, Generator, List, Optional, cast
 
 import pytest
+import pytest_timeout
 from _pytest.terminal import TerminalReporter
 from PIL import Image
 from pixelmatch import pixelmatch
 from pixelmatch.contrib.PIL import from_PIL_to_raw_data
 
 import playwright
-from playwright._impl._path_utils import get_file_dirname
 from playwright._impl._protocol_check import take_violations
 
 from .server import Server, test_server
 
-_dirname = get_file_dirname()
+_dirname = Path(__file__).parent.absolute()
 
 # Check each message that the client sends against the protocol spec.
 os.environ.setdefault("PW_CHECK_PROTOCOL", "1")
+# Run the driver as upstream runs it in its tests (for example, pages get window.builtins).
+os.environ.setdefault("PWTEST_UNDER_TEST", "1")
+# Keep the registry of bound browsers (browser.bind()) out of the user's cache folder.
+os.environ.setdefault(
+    "PWTEST_SERVER_REGISTRY", tempfile.mkdtemp(prefix="playwright-server-registry-")
+)
 
 
 def pytest_configure(config: pytest.Config) -> None:
     if os.environ.get("CI"):
         config.option.reruns = 3
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: List[pytest.Item]
+) -> None:
+    # A slow test gets three times the timeout, as test.slow() gives upstream.
+    timeout = float(config.getini("timeout"))
+    for item in items:
+        if item.get_closest_marker("slow"):
+            item.add_marker(pytest.mark.timeout(timeout * 3))
+
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo
+) -> Generator[None, None, None]:
+    # pytest-timeout cancels its timer after the report of a failure is built. The
+    # report looks up the source of every frame, which takes long enough for the
+    # timer of a test that failed just before its deadline (the 30-second timeout
+    # of the client, for example) to fire inside pytest, which kills the xdist
+    # worker. Cancel the timer before the report; the teardown gets its own below.
+    if call.when == "call" and call.excinfo is not None:
+        item.config.pluginmanager.hook.pytest_timeout_cancel_timer(item=item)
+    yield
+
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_teardown(item: pytest.Item) -> Generator[None, None, None]:
+    # The teardown runs with a timer of its own: the timer of a test that failed
+    # is cancelled above, and by pytest-timeout once the failure is reported. The
+    # timer of a test that passed is cancelled first, so that it does not fire
+    # during the teardown.
+    settings = pytest_timeout._get_item_settings(item)
+    if settings.timeout:
+        hooks = item.config.pluginmanager.hook
+        hooks.pytest_timeout_cancel_timer(item=item)
+        hooks.pytest_timeout_set_timer(item=item, settings=settings)
+    yield
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
@@ -134,6 +179,64 @@ def is_firefox(browser_name: str) -> bool:
 @pytest.fixture(scope="session")
 def is_chromium(browser_name: str) -> bool:
     return browser_name == "chromium"
+
+
+@pytest.fixture(scope="session")
+def platform() -> str:
+    """Like Node.js process.platform: "linux", "darwin" or "win32"."""
+    return "linux" if sys.platform.startswith("linux") else sys.platform
+
+
+@pytest.fixture(scope="session")
+def mac_version() -> int:
+    """The major macOS version, 0 elsewhere. Port of macVersion() in platformFixtures.ts."""
+    if sys.platform != "darwin":
+        return 0
+    darwin_major = int(os.uname().release.split(".")[0])
+    # Apple jumped from macOS 15 to macOS 26, so Darwin 25 is macOS 26.
+    return darwin_major + 1 if darwin_major >= 25 else darwin_major - 9
+
+
+@pytest.fixture(scope="session")
+def is_frozen_webkit(browser_name: str, mac_version: int) -> bool:
+    """WebKit builds that no longer get updates. Port of isFrozenWebkit in browserTest.ts."""
+    if browser_name != "webkit":
+        return False
+    if sys.platform == "darwin":
+        return mac_version < 15
+    try:
+        os_release = Path("/etc/os-release").read_text()
+    except OSError:
+        return False
+    return ("ID=debian" in os_release and 'VERSION_ID="11"' in os_release) or (
+        "ID=ubuntu" in os_release and 'VERSION_ID="20.04"' in os_release
+    )
+
+
+@pytest.fixture(scope="session")
+def allows_third_party(browser_name: str) -> bool:
+    return browser_name == "firefox"
+
+
+@pytest.fixture(scope="session")
+def default_same_site_cookie_value(browser_name: str, is_linux: bool) -> str:
+    if browser_name == "chromium":
+        return "Lax"
+    if browser_name == "firefox":
+        return "None"
+    if browser_name == "webkit" and is_linux:
+        return "Lax"
+    if browser_name == "webkit" and not is_linux:
+        return "None"
+    raise Exception(f"Invalid browser_name: {browser_name}")
+
+
+@pytest.fixture
+def create_user_data_dir(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Callable[[], Path]:
+    """Returns a function that makes a new empty user data directory."""
+    return lambda: tmp_path_factory.mktemp("user-data-dir")
 
 
 @pytest.fixture(scope="session")

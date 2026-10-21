@@ -17,11 +17,9 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from greenlet import GreenletExit, greenlet
 
-from playwright._impl._connection import Connection
 from playwright._impl._errors import Error
 from playwright._impl._greenlets import MainGreenlet
-from playwright._impl._object_factory import create_remote_object
-from playwright._impl._transport import PipeTransport
+from playwright._impl.out_of_process import PlaywrightClient
 from playwright.sync_api._generated import Playwright as SyncPlaywright
 
 if TYPE_CHECKING:
@@ -35,6 +33,8 @@ class PlaywrightContextManager:
         self._own_loop = False
         self._watcher: Optional[AbstractChildWatcher] = None
         self._exit_was_called = False
+        self._dispatcher_fiber: MainGreenlet
+        self._client: Optional[PlaywrightClient] = None
 
     def __enter__(self) -> SyncPlaywright:
         try:
@@ -50,11 +50,17 @@ Please use the Async API instead."""
 
         g_self = greenlet.getcurrent()
 
-        # Create a new fiber for the protocol dispatcher. It will be pumping events
-        # until the end of times. We will pass control to that fiber every time we
-        # block while waiting for a response.
+        # The dispatcher fiber runs the event loop until the driver goes away. Every
+        # sync call passes control to it while the call waits (wait_for_future() in
+        # playwright/_impl/_greenlets.py). The client gets the fiber, so that the
+        # event listeners and the user callbacks run in greenlets of their own.
+        async def main() -> None:
+            self._client = PlaywrightClient(dispatcher_fiber)
+            self._client._playwright.add_done_callback(lambda _: g_self.switch())
+            await self._client._close_promise
+
         def greenlet_main() -> None:
-            task = self._loop.create_task(self._connection.run_as_sync())
+            task = self._loop.create_task(main())
             while not task.done():
                 try:
                     self._loop.run_until_complete(task)
@@ -76,23 +82,12 @@ Please use the Async API instead."""
                     # see wait_for_future. run_forever() refuses to start then.
                     asyncio._set_running_loop(None)
 
-        dispatcher_fiber = MainGreenlet(greenlet_main)
-
-        self._connection = Connection(
-            dispatcher_fiber,
-            create_remote_object,
-            PipeTransport(self._loop),
-            self._loop,
-        )
-
-        # Wait until initialize completes (not just Playwright __create__), matching async.
-        self._connection.playwright_future.add_done_callback(lambda _: g_self.switch())
+        dispatcher_fiber = self._dispatcher_fiber = MainGreenlet(greenlet_main)
         dispatcher_fiber.switch()
 
+        assert self._client
         try:
-            self._playwright = SyncPlaywright(
-                self._connection.playwright_future.result()
-            )
+            self._playwright = SyncPlaywright(self._client._playwright.result())
         except BaseException:
             self.__exit__()
             raise
@@ -106,7 +101,15 @@ Please use the Async API instead."""
         if self._exit_was_called:
             return
         self._exit_was_called = True
-        self._connection.stop_sync()
+        if self._client:
+            # Close the pipe, unless the driver exited on its own or did not start.
+            # The dispatcher fiber runs the loop until the transport ends, then
+            # exits and returns here. It may be suspended in the callback that
+            # resumed this code, with the loop still running: switch to it also
+            # when the transport has ended; a switch to a dead fiber returns.
+            if not self._client._close_promise.done():
+                self._client._transport.request_stop()
+            self._dispatcher_fiber.switch()
         if self._watcher:
             self._watcher.close()
         if self._own_loop:

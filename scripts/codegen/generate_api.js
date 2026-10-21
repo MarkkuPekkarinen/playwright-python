@@ -115,7 +115,7 @@ const isAsync = options.flavor === 'async';
 
 const PW_SRC_DIR = process.env.PW_SRC_DIR;
 if (!PW_SRC_DIR)
-  fail('Set PW_SRC_DIR to a microsoft/playwright checkout at the release branch in DRIVER_VERSION.');
+  fail('Set PW_SRC_DIR to a microsoft/playwright checkout at the commit in DRIVER_VERSION (rev=).');
 const { parseApi } = require(path.join(PW_SRC_DIR, 'utils', 'doclint', 'api_parser'));
 const { Type, parseCodeLang } = require(path.join(PW_SRC_DIR, 'utils', 'doclint', 'documentation'));
 const md = require(path.join(PW_SRC_DIR, 'utils', 'markdown'));
@@ -149,7 +149,7 @@ function byName(a, b) {
 
 /** @param {string} name */
 function toSnakeCase(name) {
-  // Same as playwright._impl._helper.to_snake_case.
+  // Same as to_snake_case() in playwright/_impl/isomorphic/string_utils.py.
   return name.replace(/((?<=[a-z0-9])[A-Z]|(?!^)[A-Z](?=[a-z]))/g, '_$1').toLowerCase();
 }
 

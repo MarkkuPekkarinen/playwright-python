@@ -39,37 +39,37 @@ The upstream documentation source of truth is `docs/src/api/*.md` in the playwri
 
 ### 2. Bump the driver pin, download it, and generate api.json
 
+`DRIVER_VERSION` has two lines: `npm=`, the `playwright-core` npm version
+(a release such as `1.62.0`, a beta, or a nightly such as
+`1.65.0-alpha-2026-10-19`), and `rev=`, the `microsoft/playwright` commit that
+the package is built from. npm records that commit:
+
+```sh
+npm view playwright-core@<version> gitHead
+```
+
 The docs walk and codegen read the upstream docs from a `microsoft/playwright`
 checkout at `$PW_SRC_DIR`. **Use a separate checkout that exists only for
-rolls, on the exact release branch you roll to**: `release-<new>`, the
-`major.minor` of the new `DRIVER_VERSION` (the branch has the release's docs
-plus any cherry-picks). Never point `PW_SRC_DIR` at a checkout that someone
-works in: on `main` or a feature branch the docs differ, and the generator
-silently emits that API instead of the release's.
+rolls, at exactly the `rev=` commit.** Never point `PW_SRC_DIR` at a checkout
+that someone works in: on any other commit the docs differ, and the generator
+silently emits that API instead of the driver's. `./scripts/update_api.sh`
+refuses to run when the checkout is not at `rev=` or has local changes.
 
 ```sh
 export PW_SRC_DIR=../playwright-for-python      # the roll checkout, nothing else
 # First roll on this machine: clone it (no npm install needed).
 git clone https://github.com/microsoft/playwright.git "$PW_SRC_DIR"
-# Every roll: move it to the release branch.
+# Every roll: move it to the new rev.
 git -C "$PW_SRC_DIR" fetch origin
-git -C "$PW_SRC_DIR" checkout release-<new>     # e.g. release-1.62
-git -C "$PW_SRC_DIR" merge --ff-only origin/release-<new>
-```
-
-Check the checkout before you generate, and again before you commit:
-
-```sh
-git -C "$PW_SRC_DIR" rev-parse --abbrev-ref HEAD                  # must print release-<new>
-git -C "$PW_SRC_DIR" status --porcelain                           # must print nothing
-git -C "$PW_SRC_DIR" rev-parse HEAD origin/release-<new>          # both lines must be equal
+git -C "$PW_SRC_DIR" checkout --detach <rev>
 ```
 
 Then bump the pins and assemble the driver:
 
 ```sh
-# Edit DRIVER_VERSION (repo root): the playwright-core npm version for the new
-# release, no "v" prefix, e.g.  1.62.0
+# Edit DRIVER_VERSION (repo root), for example:
+#   npm=1.62.0
+#   rev=<npm view playwright-core@1.62.0 gitHead>
 python scripts/update_node_version.py     # refresh NODE_VERSION to the current LTS
 
 source env/bin/activate
@@ -89,32 +89,18 @@ the walk.
 
 ### 3. Identify the commit range
 
-Use the roll checkout at `$PW_SRC_DIR` (from step 2).
-Bring it up to date and ensure release branches/tags are present before walking
-the range:
+The range is every commit between the old `rev=` (in `DRIVER_VERSION` before the
+bump) and the new one. Save the commit list, oldest first, scoped to
+`docs/src/api/`:
 
 ```sh
-git -C "$PW_SRC_DIR" fetch --tags
-git -C "$PW_SRC_DIR" fetch origin 'release-*:release-*'
+git -C "$PW_SRC_DIR" log <old-rev>..<new-rev> --oneline --reverse -- docs/src/api > /tmp/roll-<new>-commits.md
 ```
 
-There is sometimes no `vX.Y.0` tag for the latest release (the bots cut release branches first and tag later). Anchor on commits, not tags.
-
-The diff range is "every commit on the new release branch since the previous release was cut". Anchor commits:
-
-- **Previous release end**: the `chore: bump version to vX.Y.0-next` commit on `main`. That commit is the first commit *after* the previous release (X.Y-1) was cut. Use its parent (`<sha>~1`) as the lower bound.
-  ```sh
-  git -C "$PW_SRC_DIR" log --all --grep="bump version to v" --oneline | head
-  ```
-- **New release end**: the tip of `release-<new>` (or the matching tag if it exists).
-
-Save the commit list, oldest first, scoped to `docs/src/api/`:
-
-```sh
-git -C "$PW_SRC_DIR" log <prev-anchor>~1..release-<new> --oneline --reverse -- docs/src/api > /tmp/roll-<new>-commits.md
-```
-
-A normal roll yields 50–100 commits. If you see 0 or thousands, the range is wrong.
+If the old `DRIVER_VERSION` has no `rev=` line (rolls before the two-line
+format), take the old commit from npm: `npm view playwright-core@<old version>
+gitHead`. A release-to-release roll yields 50–100 commits; a nightly-to-nightly
+roll a handful. If you see thousands, the range is wrong.
 
 Format the file as a markdown checklist and add the standard preamble (status legend, where to look up `api.json` etc.) — see the file from the 1.58→1.59 roll for the template.
 
@@ -168,29 +154,28 @@ A few rules of thumb that catch most "actually a PORT" cases:
 
 #### PORT
 
-Implement the change in `playwright/_impl/<module>.py`. Use the upstream JS implementation as a reference: `$PW_SRC_DIR/packages/playwright-core/src/client/<module>.ts`. Translate idioms:
+Implement the change in `playwright/_impl/<module>.py`, the line-by-line port of `$PW_SRC_DIR/packages/playwright-core/src/client/<module>.ts` (snake_case: `browserContext.ts` is `browser_context.py`). The client change that implements the new API is usually in the same upstream commit as the docs change, or close to it: port it line by line with the rules of [`playwright/_impl/transform.md`](../../../playwright/_impl/transform.md), and walk the whole client range as section 14 of that file says (`git -C "$PW_SRC_DIR" log <prev>..<rev> -- packages/playwright-core/src/client packages/isomorphic packages/protocol`). A few reminders:
 
 | Upstream JS | Python |
 |---|---|
-| `async foo(): Promise<X>` | `async def foo(self) -> X:` |
 | `foo(): X` (sync getter, no args, no body) | `@property def foo(self) -> X:` (the generator makes argument-less sync members properties — see `isPythonProperty` in `scripts/codegen/generate_api.js` — and reads `self._impl_obj.foo` without calling it. mypy does not catch a plain method here; the test does.) |
-| `await this._channel.foo({ a, b }, this._timeout(options))` | `await self._channel.foo(a=a, b=b, timeout=self._timeout(timeout))`. The generated channel method takes every protocol parameter, with no defaults; an absent option is `None`. The implementation method's own parameters use the Python (snake_case) names, with no defaults. |
+| `await this._channel.foo({ a, b }, this._timeout(options))` | `await self._channel.foo(a=a, b=b, timeout=self._timeout(timeout))`. The generated channel method takes every protocol parameter, with no defaults; an absent option is `None`. It sends the message at once and returns an awaitable (`transform.md`, 1.5). The implementation method's own parameters use the Python (snake_case) names, with no defaults. |
 | `(await this._channel.foo()).value` | `(await self._channel.foo())["value"]`. The result dict has every top-level field; a field that the driver left out is `None`. |
 | `this._channel.on('foo', ({ a }) => ...)` | `self._channel.onFoo(lambda event: ...)`; `event["a"]` is `None` when the driver left the optional field out. |
-| `try { ... } catch (e) { if (isTargetClosedError(e)) return; throw e; }` | `try: ...; except Exception as e: if is_target_closed_error(e): return; raise` (import from `playwright._impl._errors`) |
+| `try { ... } catch (e) { if (isTargetClosedError(e)) return; throw e; }` | `try: ...; except Exception as e: if is_target_closed_error(e): return; raise e` (import from `playwright._impl.errors`) |
 | Inline `[Object]` return like `{endpoint: string}` | A `TypedDict` in `playwright/_impl/_api_structures.py`, which the generator writes. It names the struct from the docs: `` "Name" <[Object]> ``, or an `* alias-python:` line under it. See `RemoteAddr`, `BrowserBindResult`, `DebuggerPausedDetails`. |
-| `binary` event/return field | The Python channel layer hands you a base64 string. Decode with `base64.b64decode(value)` before exposing as `bytes`. See `Screencast._dispatch_frame`. |
+| `binary` event/return field | The channel layer hands you a base64 string. Decode with `base64.b64decode(value)` before exposing as `bytes`. See the frame event in `screencast.py`. |
 
 When implementing a new ChannelOwner subclass (one constructed by the protocol with `(parent, type, guid, initializer)`):
-1. Register it in `playwright/_impl/_object_factory.py:create_remote_object` — otherwise the guid resolves to `DummyObject` and downstream code breaks mysteriously.
+1. Register it in `_object_factories()` in `playwright/_impl/connection.py` (the port of the factory table of `connection.ts`); the connection raises for a type it has no factory for.
 2. Add it to `playwright/_impl/_api_classes.py` (the import and `__all__`). The generator emits every Python class in the docs, and the generated API imports each implementation from that file. If the class is missing there, `_generated.py` fails to import.
 
 When implementing a non-ChannelOwner wrapper class (a plain class that holds a Page/Context reference, like `Screencast`, `Clock`):
 - Add it to `playwright/_impl/_api_classes.py`, as for a ChannelOwner subclass.
-- Set `self._loop = parent._loop` and `self._dispatcher_fiber = parent._dispatcher_fiber` in `__init__`. The generated `AsyncBase`/`SyncBase` wrappers read these; missing them gives `AttributeError: 'X' object has no attribute '_loop'` at first use.
+- Set `self._loop = parent._loop` and `self._dispatcher_fiber = parent._dispatcher_fiber` in `__init__`, with the `# Python:` comment that the other wrappers have. The generated `AsyncBase`/`SyncBase` wrappers read these; missing them gives `AttributeError: 'X' object has no attribute '_loop'` at first use. A user callback that the new code calls and awaits runs through `run_in_greenlet()` under the sync API (`transform.md`, section 13).
 
 When the docs add a new struct (an inline `[Object]` with named fields):
-- The generator writes its TypedDict into `_api_structures.py`. Never edit that file by hand; internal types go in `_internal_structures.py`.
+- The generator writes its TypedDict into `_api_structures.py`. Never edit that file by hand; internal types go in `internal_structures.py`.
 - It needs a Python name in the docs: a name before the type (`` - `size` "ScreenSize" <[Object]> ``), or an `* alias-python:` line under the type. The generator fails with "No Python name for the struct at …" until one exists. Nested structs need names too.
 - Re-export it from both `playwright/async_api/__init__.py` and `playwright/sync_api/__init__.py`: assignment line plus an entry in `__all__`. Same pattern as `ViewportSize`, `RemoteAddr`.
 
@@ -241,7 +226,7 @@ The script, for `sync` and then `async`:
 1. runs `node scripts/codegen/generate_api.js --flavor <flavor>` (reads the docs from `$PW_SRC_DIR`) straight into `playwright/<flavor>_api/_generated.py`,
 2. invokes `pre-commit run --files` on the generated file.
 
-It then runs `python scripts/codegen/generate_protocol.py`, which reads `packages/protocol/spec/*.yml` from `$PW_SRC_DIR` and writes the command parameter tables to `playwright/_impl/_protocol.py`, the message types to `playwright/_impl/_protocol_types.py` and the typed channels to `playwright/_impl/_protocol_channels.py`.
+It then runs `python scripts/codegen/generate_protocol.py`, which reads `packages/protocol/spec/*.yml` from `$PW_SRC_DIR` and writes the command parameter tables to `playwright/_impl/_protocol.py`, the message types to `playwright/_impl/protocol_types.py`, the typed channels to `playwright/_impl/protocol_channels.py` and the validator to `playwright/_impl/protocol/validator.py`.
 
 Then run `mypy playwright` and work through the errors in `_generated.py` — each one is a call into `_impl/` that the implementation does not support yet.
 
@@ -266,7 +251,7 @@ Failure modes and fixes:
 | mypy: incompatible argument type in `_generated.py` | The docs type changed, or `_impl/` declares a narrower type. | Match the type in `_impl/`, or fix the docs with a Python-only declaration (`* langs: python`). |
 | generator: `No Python name for the struct at X.y.z` | A new inline `[Object]` with no name in the docs. | Name it in the docs: `` "Name" <[Object]> ``. |
 | generator: `The struct X has different fields at A and B` | Two places in the docs share one struct name, but their fields differ. | Give one place its own name in the docs. |
-| `_generated.py` gains or loses members that the commit walk never mentioned | `PW_SRC_DIR` is not on `release-<new>` (for example on `main` or a feature branch), or is behind `origin/release-<new>`. | Run the checkout checks from step 2, fix the checkout, regenerate. |
+| `_generated.py` gains or loses members that the commit walk never mentioned | `PW_SRC_DIR` is not at the `rev=` commit, or the range of the walk is wrong. | Check out `rev=` (step 2), regenerate, and recompute the range (step 3). |
 | generator: `Unknown docs type "T" at X.y` | A docs type the type table in `generate_api.js` (`toPy`) does not know. | Add it to `toPy`. |
 | generator: `required parameter z follows an optional one` | The docs order params so that Python would need a default before a non-default. | Fix the docs, for example with a Python-only `### param:` or `### option:`, as `select_option(value)` has. |
 | generator: `the entry "…" no longer matches anything; remove it` | An upstream change made a rules entry unnecessary (or renamed what it points at). | Delete it, or re-key it to the new docs name. |
@@ -274,7 +259,6 @@ Failure modes and fixes:
 | `pre-commit` keeps reformatting `_generated.py` on each run | First run after regen always reformats once; rerun until idle. | `pre-commit run --all-files` to settle. |
 | A kwarg in `_impl/` that the docs don't mention (e.g. legacy name from a doc rename) | Nothing fails: the generator simply never passes it. | If the param is positional with no default, just rename it in `_impl/`. Check `packages/protocol/spec/*.yml` and the server dispatcher — if the wire field renamed too, also update the channel-send dict key. Only use `extraOptions` for genuinely hidden internal kwargs (`default_browser_type`). |
 | `AttributeError: 'X' object has no attribute '_loop'` (or `_dispatcher_fiber`) at first use of a new wrapper class | The non-ChannelOwner wrapper isn't initializing the fields the generated `AsyncBase`/`SyncBase` reads. | In the wrapper's `__init__`, set `self._loop = parent._loop` and `self._dispatcher_fiber = parent._dispatcher_fiber`. |
-| `'NoneType' object has no attribute 'get'` after `send_return_as_dict` | Method's protocol response carries no fields and `send_return_as_dict` returned `None`. | `(result or {}).get(...)`. |
 | A test fails at teardown with `Protocol violations: X.y: params.z: unknown` (or `missing`, or `expected …`) | The client sends a message that the protocol spec does not allow. The driver would drop an unknown parameter without an error. | Fix the send in `_impl/`: rename the key after a wire rename, or remove a client-side option before the send. |
 | Frame/buffer payload arrives as a `str` instead of `bytes` | Protocol `binary` fields cross the wire as base64. | `base64.b64decode(value)` in the impl before exposing. |
 
@@ -282,12 +266,18 @@ After the script settles, run `pre-commit run --all-files` once more to confirm 
 
 ### 6. Add tests
 
-For each PORT, port the upstream test that covers it, as an async test and a matching sync test. Conventions:
+Copy the upstream registry of the new release, then bring the Python tests in line with it:
 
-- The upstream file decides the Python file: `tests/page/expect-misc.spec.ts` becomes `tests/async/test_expect_misc.py` and `tests/sync/test_expect_misc.py`. Create the file if it does not exist.
-- The upstream title decides the test name: the `describe` title and the test title, in snake_case. `test('should support pseudo element')` in `test.describe('toHaveCSS')` becomes `test_to_have_css_should_support_pseudo_element`.
-- When no upstream test covers the change, extend an existing test before you add a new one.
-- Use `from playwright.async_api import …`, **not** `from playwright._impl._page import Page` (the impl class doesn't have the public wrappers like `expect_console_message`).
+```sh
+cp "$PW_SRC_DIR/tests/registry.md" tests/upstream_registry.md
+python scripts/check_test_registry.py --report
+```
+
+- **New identifiers**: port each new upstream test, as an async test and a matching sync test. `python scripts/check_test_registry.py --missing <code or file glob>` prints the file and the expected name of each. The upstream file decides the Python file (`tests/page/expect-misc.spec.ts` becomes `tests/async/page/test_expect_misc.py` and `tests/sync/page/test_expect_misc.py`); the identifier and the title decide the name (see [Tests](../../../AGENTS.md#tests)).
+- **Changed titles**: the checker names the expected name; rename the Python test and port the changed body.
+- **Removed identifiers**: delete the Python test (the checker reports it as not in the registry).
+- **Not ported**: a test that can not exist in Python goes in `tests/upstream_not_ported.txt`, with the reason. The checker fails on a rule that no longer matches a test.
+- Use `from playwright.async_api import …`, **not** `from playwright._impl.page import Page` (the impl class doesn't have the public wrappers like `expect_console_message`).
 - For event-info objects, `await message_info.value` (it's an `async` property).
 - Don't write tests that hang the page (e.g. `page.evaluate(... fetch slow ...)` followed by `page.close()` from a fixture) — the request task gets a `TargetClosedError`. Use `page.on("event", handler)` to capture state at event time instead.
 - `playwright install chromium` (no `--with-deps`) is sufficient for the test suite under sandbox.
@@ -300,15 +290,15 @@ For each PORT, port the upstream test that covers it, as an async test and a mat
 
 ### 8. Final verification
 
-Repeat the checkout checks from step 2: the committed `_generated.py` must come from `release-<new>`.
+Check that `$PW_SRC_DIR` is still at the `rev=` commit, with no local changes: the committed `_generated.py` must come from it.
 
 ```sh
 pre-commit run --all-files
-mypy playwright                 # 2 pre-existing errors in _json_pipe.py and _artifact.py are unrelated
+mypy playwright
 pytest --browser chromium tests/async/<files-you-touched> tests/sync/<files-you-touched>
 ```
 
-Then a smoke regression on a few neighboring suites (`tests/async/test_browser*.py`, `test_cdp_session.py`, `test_tracing.py`, `test_dialog.py`, `test_page_*.py`) to make sure nothing inherent to the port shifted.
+Then run `python scripts/check_test_registry.py`, and a smoke regression on a few neighboring suites (for example `tests/async/library/test_browser*.py`, `tests/async/library/chromium/test_session.py`, `tests/async/library/test_tracing.py`, `tests/async/page/test_page_*.py`) to make sure nothing inherent to the port shifted.
 
 ## Reference: `python_rules.js` tables
 
@@ -329,7 +319,7 @@ All keys use docs names: `Class.member` or `Class.member.arg`, with the upstream
 - **A cluster of rules on the same class is a smell.** If you're about to add five entries for `Foo.*`, you're almost certainly looking at a class that needs to be implemented. Implement the whole thing once and the entries disappear.
 - **Watch for revert pairs in the same range.** 1.59 added and reverted `Browser.isRemote` (#39613 / #39620) inside the same release. Walking chronologically lets you skip the add when you see the revert later.
 - **Watch for rename-revert pairs.** 1.59 had `Locator.normalize` → `Locator.toCode` (#39648) → `Locator.normalize` (#39754). Final state wins; only port the last.
-- **Doc renames almost always include a wire-protocol rename.** Whenever you see `### param: X.y.oldName` → `### param: X.y.newName` in a doc commit, also `git -C "$PW_SRC_DIR" show <sha> -- packages/protocol/spec/` and the corresponding `*Dispatcher.ts` file. If the wire field changed too, the regenerated `_protocol_channels.py` renames the argument of the channel method, and mypy reports each call in `_impl/` that passes the old name.
+- **Doc renames almost always include a wire-protocol rename.** Whenever you see `### param: X.y.oldName` → `### param: X.y.newName` in a doc commit, also `git -C "$PW_SRC_DIR" show <sha> -- packages/protocol/spec/` and the corresponding `*Dispatcher.ts` file. If the wire field changed too, the regenerated `protocol_channels.py` renames the argument of the channel method, and mypy reports each call in `_impl/` that passes the old name.
 - **TypedDicts beat `Dict[str, X]` for any structured return.** When the docs describe a return as `[Object]` with named fields, name the struct for the generator, which writes its `TypedDict` into `_api_structures.py`, and re-export it from both public `__init__.py` files. Zero runtime cost (it's still a `dict`), and the docstrings expand its fields from the docs.
 - **Positional renames are free.** A param with no default before any `*` separator is positional-or-keyword in Python, but realistic call sites pass it positionally. Renaming such a param doesn't break callers.
 - **The "Backport changes" GitHub issue can be misleading.** In the 1.59 roll its checkboxes were all marked `[x]` with annotations like "✅ IMPLEMENTED", but several of those features had not actually been merged into the Python port. Trust the `docs/src/api/` walk over the issue.

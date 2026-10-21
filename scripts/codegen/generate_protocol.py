@@ -15,12 +15,13 @@
 # Generates from the protocol spec (packages/protocol/spec/*.yml in
 # microsoft/playwright):
 # - playwright/_impl/_protocol.py: the tables that _protocol_check.py uses;
-# - playwright/_impl/_protocol_types.py: the TypedDicts of the messages;
-# - playwright/_impl/_protocol_channels.py: a typed channel class per interface.
+# - playwright/_impl/protocol_types.py: the TypedDicts of the messages;
+# - playwright/_impl/protocol_channels.py: a typed channel class per interface;
+# - playwright/_impl/protocol/validator.py: the port of validator.ts.
 #
 # Usage:
 #   PW_SRC_DIR=<microsoft/playwright checkout> python scripts/codegen/generate_protocol.py \
-#       --out <file> --types-out <file> --channels-out <file>
+#       --out <file> --types-out <file> --channels-out <file> --validator-out <file>
 #
 # The spec is loaded the same way as utils/protocol_spec.js does it. The output
 # is not formatted; run black on it.
@@ -245,10 +246,13 @@ class Command:
         name: str,
         params: List[Tuple[str, str]],
         result: Optional[Payload],
+        internal: bool,
     ) -> None:
         self.name = name
         self.params = params
         self.result = result
+        # `internal: true` in the spec: the call is not reported as an API call.
+        self.internal = internal
 
 
 class Interface:
@@ -323,7 +327,9 @@ def generate_types(protocol: Dict[str, Any]) -> Tuple[str, List[Interface], Set[
                     result.type_name,
                     emitter.fields(result.type_name, returns, top_level=True),
                 )
-            interface.commands.append(Command(method, params, result))
+            interface.commands.append(
+                Command(method, params, result, bool(command.get("internal")))
+            )
         for event, event_spec in (item.get("events") or {}).items():
             properties = converter.properties(
                 (event_spec or {}).get("parameters"), f"{name}.{event}"
@@ -358,8 +364,8 @@ def generate_types(protocol: Dict[str, Any]) -> Tuple[str, List[Interface], Set[
             "if TYPE_CHECKING:",
             "    from typing_extensions import NotRequired",
             "",
-            "    from playwright._impl._channel import Channel",
-            "    from playwright._impl._protocol_channels import (",
+            "    from playwright._impl.channel_owner import Channel",
+            "    from playwright._impl.protocol_channels import (",
             *[f"        {channel}," for channel in used_channels],
             "    )",
             "",
@@ -371,7 +377,7 @@ def generate_types(protocol: Dict[str, Any]) -> Tuple[str, List[Interface], Set[
 
 
 def qualify(type_text: str, type_names: Set[str]) -> str:
-    """Prefixes the names from _protocol_types.py with `channels.`."""
+    """Prefixes the names from protocol_types.py with `channels.`."""
 
     def prefix(match: "re.Match[str]") -> str:
         name = match.group(0)
@@ -412,19 +418,23 @@ def generate_channels(interfaces: List[Interface], type_names: Set[str]) -> str:
                 )
                 + "}"
             )
+            # Like a call on the channel proxy in client/channelOwner.ts: the
+            # message goes out when the method is called, and the method returns
+            # an awaitable of the result.
             if command.result:
-                returns = f"channels.{command.result.type_name}"
-                body = (
-                    f'        result = await self._call("{command.name}", {params}, timeout)\n'
-                    f"        return {payload_dict(command.result, 'result')}"
-                )
+                returns = f"Awaitable[channels.{command.result.type_name}]"
+                mapper = f"lambda result: {payload_dict(command.result, 'result')}"
             else:
-                returns = "None"
-                body = f'        await self._call("{command.name}", {params}, timeout)'
+                returns = "Awaitable[None]"
+                mapper = "None"
+            call_args = f'"{command.name}", {params}, timeout, {mapper}'
+            if command.internal:
+                call_args += ", is_internal=True"
             methods.append(
-                f"    async def {python_name(command.name)}(\n"
+                f"    def {python_name(command.name)}(\n"
                 f"        self,\n{args}        timeout: float = 0,\n"
-                f"    ) -> {returns}:\n{body}"
+                f"    ) -> {returns}:\n"
+                f"        return self._call({call_args})"
             )
         for event, payload in interface.events:
             if payload:
@@ -450,7 +460,15 @@ def generate_channels(interfaces: List[Interface], type_names: Set[str]) -> str:
     code = "\n\n\n".join(blocks)
     typing_names = ["TYPE_CHECKING", "Dict", "Type"] + [
         name
-        for name in ["Any", "Callable", "List", "Literal", "Optional", "Sequence"]
+        for name in [
+            "Any",
+            "Awaitable",
+            "Callable",
+            "List",
+            "Literal",
+            "Optional",
+            "Sequence",
+        ]
         if re.search(rf"\b{name}\[|\b{name}\b(?!\[)", code)
     ]
     return "\n".join(
@@ -461,10 +479,10 @@ def generate_channels(interfaces: List[Interface], type_names: Set[str]) -> str:
             "",
             f"from typing import {', '.join(sorted(typing_names))}",
             "",
-            "from playwright._impl._channel import Channel",
+            "from playwright._impl.channel_owner import Channel",
             "",
             "if TYPE_CHECKING:",
-            "    from playwright._impl import _protocol_types as channels",
+            "    from playwright._impl import protocol_types as channels",
             "",
             "",
             code,
@@ -479,14 +497,197 @@ def generate_channels(interfaces: List[Interface], type_names: Set[str]) -> str:
     )
 
 
+def generate_validator(protocol: Dict[str, Any]) -> str:
+    """Port of the validator.ts part of upstream's utils/generate_channels.js."""
+    channels = {name for name, item in protocol.items() if item["type"] == "interface"}
+    mixins = {name: item for name, item in protocol.items() if item["type"] == "mixin"}
+    derived_classes: Dict[str, List[str]] = {}
+    for name, item in protocol.items():
+        if item["type"] == "interface" and item.get("extends"):
+            derived_classes.setdefault(item["extends"], []).append(name)
+    lines: List[str] = []
+
+    def add_scheme(name: str, scheme: str) -> None:
+        lines.append(f'scheme["{name}"] = {scheme}')
+
+    def inline_type(type: Any, indent: str) -> Tuple[str, bool]:
+        if isinstance(type, str):
+            optional = type.endswith("?")
+            if optional:
+                type = type[:-1]
+            if type == "binary":
+                return "t_binary", optional
+            if type == "json":
+                return "t_any", optional
+            if type in ("string", "boolean", "undefined", "int", "float"):
+                return f"t_{type}", optional
+            if type in channels:
+                derived = [*derived_classes.get(type, []), type]
+                names = ", ".join(f'"{c}"' for c in derived)
+                return f"t_channel([{names}])", optional
+            if type == "Channel":
+                return 't_channel("*")', optional
+            return f't_type("{type}")', optional
+        kind = type["type"]
+        optional = kind.endswith("?")
+        if kind.startswith("array"):
+            inner, _ = inline_type(type["items"], indent)
+            return f"t_array({inner})", optional
+        if kind.startswith("enum"):
+            literals = ", ".join(
+                f'"{js_string(literal)}"' for literal in type["literals"]
+            )
+            return f"t_enum([{literals}])", optional
+        if kind.startswith("object"):
+            return object_type(type.get("properties") or {}, indent), optional
+        raise SystemExit(f"Invalid item: {type}")
+
+    def properties(props: Any, indent: str) -> List[str]:
+        result: List[str] = []
+        for name, value in (props or {}).items():
+            if name.startswith("$mixin"):
+                result.extend(properties(mixins[value].get("properties"), indent))
+                continue
+            inner, optional = inline_type(value, indent)
+            wrapped = f"t_optional({inner})" if optional else inner
+            result.append(f'{indent}"{name}": {wrapped},')
+        return result
+
+    def object_type(props: Any, indent: str) -> str:
+        if not props:
+            return "t_object({})"
+        inner = "\n".join(properties(props, indent + "    "))
+        return f"t_object(\n{indent}    {{\n{inner}\n{indent}    }}\n{indent})"
+
+    for name, item in protocol.items():
+        if item["type"] == "interface":
+            ancestor = item
+            while not ancestor.get("initializer"):
+                if not ancestor.get("extends"):
+                    break
+                ancestor = protocol[ancestor["extends"]]
+            add_scheme(
+                f"{name}Initializer",
+                (
+                    object_type(ancestor["initializer"], "")
+                    if ancestor.get("initializer")
+                    else "t_optional(t_object({}))"
+                ),
+            )
+            for event_name, event in (item.get("events") or {}).items():
+                event = event or {}
+                params_name = f"{name}{title_case(event_name)}Event"
+                add_scheme(
+                    params_name,
+                    (
+                        object_type(event["parameters"], "")
+                        if event.get("parameters")
+                        else "t_optional(t_object({}))"
+                    ),
+                )
+                for derived in derived_classes.get(name, []):
+                    add_scheme(
+                        f"{derived}{title_case(event_name)}Event",
+                        f't_type("{params_name}")',
+                    )
+            for method_name, method in (item.get("commands") or {}).items():
+                method = method or {}
+                params_name = f"{name}{title_case(method_name)}Params"
+                add_scheme(
+                    params_name,
+                    (
+                        object_type(method["parameters"], "")
+                        if method.get("parameters")
+                        else "t_optional(t_object({}))"
+                    ),
+                )
+                for derived in derived_classes.get(name, []):
+                    add_scheme(
+                        f"{derived}{title_case(method_name)}Params",
+                        f't_type("{params_name}")',
+                    )
+                result_name = f"{name}{title_case(method_name)}Result"
+                add_scheme(
+                    result_name,
+                    (
+                        object_type(method["returns"], "")
+                        if method.get("returns")
+                        else "t_optional(t_object({}))"
+                    ),
+                )
+                for derived in derived_classes.get(name, []):
+                    add_scheme(
+                        f"{derived}{title_case(method_name)}Result",
+                        f't_type("{result_name}")',
+                    )
+                if method.get("errorDetails"):
+                    details_name = f"{name}{title_case(method_name)}ErrorDetails"
+                    add_scheme(details_name, object_type(method["errorDetails"], ""))
+                    for derived in derived_classes.get(name, []):
+                        add_scheme(
+                            f"{derived}{title_case(method_name)}ErrorDetails",
+                            f't_type("{details_name}")',
+                        )
+        elif item["type"] == "object":
+            add_scheme(name, object_type(item.get("properties") or {}, ""))
+        elif item["type"] == "enum":
+            literals = ", ".join(
+                f'"{js_string(literal)}"' for literal in item["literals"]
+            )
+            add_scheme(name, f"t_enum([{literals}])")
+
+    return "\n".join(
+        [
+            LICENSE,
+            VALIDATOR_DOCSTRING,
+            "from playwright._impl.protocol.validator_primitives import (  # noqa: F401",
+            "    ValidationError,",
+            "    Validator,",
+            "    ValidatorContext,",
+            "    create_metadata_validator,",
+            "    create_wait_info_validator,",
+            "    find_validator,",
+            "    maybe_find_validator,",
+            "    scheme,",
+            "    t_any,",
+            "    t_array,",
+            "    t_binary,",
+            "    t_boolean,",
+            "    t_channel,",
+            "    t_enum,",
+            "    t_float,",
+            "    t_int,",
+            "    t_object,",
+            "    t_optional,",
+            "    t_string,",
+            "    t_type,",
+            "    t_undefined,",
+            ")",
+            "",
+            *lines,
+            "",
+        ]
+    )
+
+
+VALIDATOR_DOCSTRING = '''"""Port of packages/protocol/src/validator.ts.
+
+Generated by scripts/codegen/generate_protocol.py from packages/protocol/spec, as
+upstream's utils/generate_channels.js generates validator.ts. Do not edit.
+"""
+'''
+
+
 CHANNELS_DOCSTRING = '''"""Typed channels for the protocol interfaces, generated from packages/protocol/spec.
 
 Like upstream's channels in packages/protocol/src/channels.d.ts: each command is
-an async method with the protocol name and parameters, and each event has
-on<Event> and off<Event> methods. Every parameter must be passed; an absent
-optional parameter is None. The result and the event payloads have every
-top-level field; a field that the driver left out is None. `timeout` is the
-timeout of the message, in milliseconds; 0 means no timeout.
+a method with the protocol name and parameters, and each event has on<Event> and
+off<Event> methods. As on the channel proxy in client/channelOwner.ts, calling a
+command sends its message at once; the method returns an awaitable of the result.
+Every parameter must be passed; an absent optional parameter is None. The result
+and the event payloads have every top-level field; a field that the driver left
+out is None. `timeout` is the timeout of the message, in milliseconds; 0 means no
+timeout.
 
 Generated by scripts/codegen/generate_protocol.py. Do not edit.
 """
@@ -497,7 +698,7 @@ TYPES_DOCSTRING = '''"""Types of the protocol messages, generated from packages/
 
 The names follow upstream's utils/generate_channels.js: <Interface>Initializer,
 <Interface><Method>Result and <Interface><Event>Event. The parameters of each
-command are the arguments of its method in _protocol_channels.py. An object that
+command are the arguments of its method in protocol_channels.py. An object that
 the spec writes inline is named after its owner and field, for example
 PageInitializerViewportSize or BrowserNewContextParamsProxy. A reference to
 another protocol object has the type <Interface>Channel.
@@ -534,6 +735,7 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument("--types-out", required=True)
     parser.add_argument("--channels-out", required=True)
+    parser.add_argument("--validator-out", required=True)
     args = parser.parse_args()
     pw_src_dir = os.environ.get("PW_SRC_DIR")
     if not pw_src_dir:
@@ -544,6 +746,7 @@ def main() -> None:
     text = generate(protocol)
     types_text, interfaces, type_names = generate_types(protocol)
     channels_text = generate_channels(interfaces, type_names)
+    validator_text = generate_validator(protocol)
     if errors:
         for error in errors:
             print(error, file=sys.stderr)
@@ -551,6 +754,7 @@ def main() -> None:
     Path(args.out).write_text(text, encoding="utf-8")
     Path(args.types_out).write_text(types_text, encoding="utf-8")
     Path(args.channels_out).write_text(channels_text, encoding="utf-8")
+    Path(args.validator_out).write_text(validator_text, encoding="utf-8")
 
 
 if __name__ == "__main__":

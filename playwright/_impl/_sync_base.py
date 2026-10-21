@@ -13,14 +13,13 @@
 # limitations under the License.
 
 import asyncio
-import traceback
+import sys
 from contextlib import AbstractContextManager
 from types import TracebackType
 from typing import (
     Any,
+    Awaitable,
     Callable,
-    Coroutine,
-    Generator,
     Generic,
     Optional,
     Type,
@@ -29,7 +28,6 @@ from typing import (
     cast,
 )
 
-from playwright._impl._connection import _capture_stack_trace
 from playwright._impl._errors import Error
 from playwright._impl._greenlets import connection_closed_error, wait_for_future
 from playwright._impl._impl_to_api_mapping import ImplToApiMapping, ImplWrapper
@@ -82,6 +80,10 @@ class EventContextManager(Generic[T], AbstractContextManager):
             self._event.value
 
 
+async def _wait(awaitable: Awaitable[Any]) -> Any:
+    return await awaitable
+
+
 class SyncBase(ImplWrapper):
     def __init__(self, impl_obj: Any) -> None:
         super().__init__(impl_obj)
@@ -91,11 +93,11 @@ class SyncBase(ImplWrapper):
     def __str__(self) -> str:
         return self._impl_obj.__str__()
 
-    def _sync(
-        self,
-        coro: Union[Coroutine[Any, Any, Any], Generator[Any, Any, Any]],
-    ) -> Any:
+    def _sync(self, awaitable: Awaitable[Any]) -> Any:
         __tracebackhide__ = True
+        # An API call returns the coroutine of the call, or, when it runs inside
+        # another call, the awaitable of the channel call (a future).
+        coro = awaitable if asyncio.iscoroutine(awaitable) else _wait(awaitable)
         if self._loop.is_closed():
             coro.close()
             raise Error("Event loop is closed! Is Playwright already stopped?")
@@ -104,8 +106,10 @@ class SyncBase(ImplWrapper):
             raise connection_closed_error()
 
         task: asyncio.tasks.Task[Any] = self._loop.create_task(coro)
-        setattr(task, "__pw_stack__", _capture_stack_trace())
-        setattr(task, "__pw_stack_trace__", traceback.extract_stack(limit=10))
+        # The task runs in the dispatcher fiber, where the stack of this call is not
+        # visible. The client continues the stack from the caller's frame, which it
+        # reads from the task (capture_raw_stack() in utils/stack_trace.py).
+        setattr(task, "__pw_caller_frame__", sys._getframe(1))
 
         wait_for_future(self._loop, self._dispatcher_fiber, task)
         return task.result()
